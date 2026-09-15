@@ -6,13 +6,13 @@ use std::io::Cursor;
 use std::path::Path;
 extern crate alloc;
 use alloc::boxed::Box;
-use symphonia::core::audio::{AudioBuffer, Signal};
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::errors::{Error, Result};
 use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::{Hint, Probe};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 pub type WaveResult<T> = Result<T>;
 pub type WaveError = Error;
@@ -63,136 +63,84 @@ impl Wave {
         Wave::decode(source, track, hint)
     }
 
-    /// Decode track from the given source.
-    fn decode(source: Box<dyn MediaSource>, track: Option<usize>, hint: Hint) -> WaveResult<Wave> {
+    /// Decode track from the given source, with the given registries for codecs and formats
+    pub fn decode_with(source: Box<dyn MediaSource>, track: Option<usize>, hint: Hint, codec_registry: &CodecRegistry, probe: &Probe) -> WaveResult<Wave> {
         let stream = MediaSourceStream::new(source, Default::default());
 
-        let format_opts = FormatOptions {
-            enable_gapless: false,
-            ..Default::default()
-        };
+        let mut format_opts = FormatOptions::default();
 
         let metadata_opts: MetadataOptions = Default::default();
 
         let mut wave: Option<Wave> = None;
 
-        match symphonia::default::get_probe().format(&hint, stream, &format_opts, &metadata_opts) {
-            Ok(probed) => {
-                let mut reader = probed.format;
+        let mut probed = symphonia::default::get_probe().probe(&hint, stream, format_opts, metadata_opts)?;
+        // Select track if specified, otherwise select the first track with a known codec.
+        let Some((track, track_codec)) =
+            // Get a slice of tracks
+            track.map(|idx| probed.tracks().get(idx).map_or([].as_ref(), std::slice::from_ref)).unwrap_or_else(|| {
+                probed
+                .tracks()
+            })
+            .iter()
+            .filter_map(|t| t.codec_params.as_ref().and_then(|i| i.audio()).map(|codec| (t, codec)))
+            .next()
+        else { return Err(Error::DecodeError("Could not find track.")); };
 
-                // Select track if specified, otherwise select the first track with a known codec.
-                let track = track.and_then(|t| reader.tracks().get(t)).or_else(|| {
-                    reader
-                        .tracks()
-                        .iter()
-                        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-                });
+        let track_id = track.id;
 
-                let track_id = match track {
-                    Some(track) => track.id,
-                    _ => return Err(Error::DecodeError("Could not find track.")),
-                };
+        let decode_opts = AudioDecoderOptions::default();
 
-                let track = match reader.tracks().iter().find(|track| track.id == track_id) {
-                    Some(track) => track,
-                    _ => return Err(Error::DecodeError("Could not find track.")),
-                };
+        let mut decoder = codec_registry.make_audio_decoder(track_codec, &decode_opts)?;
 
-                let decode_opts = DecoderOptions::default();
-
-                let mut decoder =
-                    symphonia::default::get_codecs().make(&track.codec_params, &decode_opts)?;
-
-                loop {
-                    let packet = match reader.next_packet() {
-                        Ok(packet) => packet,
-                        Err(err) => {
-                            if let Some(wave_output) = wave {
-                                return Ok(wave_output);
-                            } else {
-                                return Err(err);
-                            }
-                        }
-                    };
-
-                    // If the packet does not belong to the selected track, skip it.
-                    if packet.track_id() != track_id {
-                        continue;
+        loop {
+            let packet = match probed.next_packet() {
+                Ok(Some(packet)) => packet,
+                Ok(None) => {
+                    if let Some(wave_output) = wave {
+                        return Ok(wave_output);
+                    } else {
+                        // This is the closest error I can think of
+                        return Err(Error::SeekError(symphonia::core::errors::SeekErrorKind::OutOfRange));
                     }
-
-                    match decoder.decode(&packet) {
-                        Ok(decoded) => {
-                            if wave.is_none() {
-                                let spec = *decoded.spec();
-                                wave = Some(Wave::new(spec.channels.count(), spec.rate as f64));
-                            } else {
-                                // TODO: Check that audio spec hasn't changed.
-                            }
-
-                            if let Some(ref mut wave_output) = wave {
-                                let mut dest = AudioBuffer::<f32>::new(
-                                    decoded.capacity() as u64,
-                                    *decoded.spec(),
-                                );
-                                dest.render_silence(Some(decoded.frames()));
-
-                                match &decoded {
-                                    symphonia::core::audio::AudioBufferRef::U8(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::U16(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::U24(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::U32(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::S8(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::S16(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::S24(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::S32(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::F32(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                    symphonia::core::audio::AudioBufferRef::F64(reff) => {
-                                        reff.convert(&mut dest);
-                                    }
-                                }
-
-                                let buffer_len = decoded.frames();
-
-                                for channel in 0..dest.spec().channels.count() {
-                                    let x = dest.chan(channel);
-                                    if channel == 0 {
-                                        for _i in 0..buffer_len {
-                                            wave_output.push(0.0);
-                                        }
-                                    }
-                                    for i in 0..buffer_len {
-                                        wave_output.set(
-                                            channel,
-                                            wave_output.len() - buffer_len + i,
-                                            x[i],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => return Err(err),
+                },
+                Err(err) => {
+                    if let Some(wave_output) = wave {
+                        return Ok(wave_output);
+                    } else {
+                        return Err(err);
                     }
                 }
+            };
+
+            // If the packet does not belong to the selected track, skip it.
+            if packet.track_id != track_id {
+                continue;
             }
-            Err(err) => Err(err),
+
+            let decoded = decoder.decode(&packet)?;
+            if wave.is_none() {
+                let spec = decoded.spec();
+                wave = Some(Wave::new(spec.channels().count(), spec.rate() as f64));
+            } else {
+                // TODO: Check that audio spec hasn't changed.
+            }
+
+            if let Some(ref mut wave_output) = wave {
+                let buffer_len = decoded.frames();
+                let old_len = wave_output.len();
+                wave_output.resize(old_len + buffer_len);
+                // We can't reuse this buffer because the lifetimes are leaked, and `Vec::recycle` isn't stable yet
+                let mut channels: Vec<_> =
+                    wave_output.channels_slice_mut()
+                    .map(|channel| &mut channel[old_len..])
+                    .collect();
+                decoded.copy_to_slice_planar(channels.as_mut_slice());
+            }
         }
+    }
+
+    /// Decode track from the given source.
+    fn decode(source: Box<dyn MediaSource>, track: Option<usize>, hint: Hint) -> WaveResult<Wave> {
+        Self::decode_with(source, track, hint, symphonia::default::get_codecs(), symphonia::default::get_probe())
     }
 }
