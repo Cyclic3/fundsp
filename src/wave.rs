@@ -139,14 +139,20 @@ impl Wave {
         &mut self.vec[channel]
     }
 
+    /// Return mutable references to each channel
+    #[inline]
+    pub fn channels_slice_mut(&mut self) -> impl ExactSizeIterator<Item=&mut [f32]> {
+        self.vec.iter_mut().map(|i| i.as_mut_slice())
+    }
+
     /// Add a channel to the wave from a slice of samples.
     /// The length of the wave and the number of samples must match.
     /// If there are no channels yet, then the length of the wave
     /// will become the length of the slice.
-    pub fn push_channel(&mut self, samples: &[f32]) {
-        assert!(self.channels() == 0 || self.len() == samples.len());
+    pub fn push_channel(&mut self, samples: impl AsRef<[f32]> + Into<Vec<f32>>) {
+        assert!(self.channels() == 0 || self.len() == samples.as_ref().len());
         if self.channels() == 0 {
-            self.len = samples.len();
+            self.len = samples.as_ref().len();
         }
         self.vec.push(samples.into());
     }
